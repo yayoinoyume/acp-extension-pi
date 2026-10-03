@@ -16,6 +16,7 @@ import {
 } from "acp-extension-core";
 import { PiRpcConnection, initializeResponse } from "./connection.js";
 import { PI_EXTENSIONS_ENV, parsePiLaunchArgs } from "./extensions.js";
+import { resolvePiLaunch } from "./launch.js";
 import { MCP_CONFIG_ENV } from "./mcp.js";
 
 const SHUTDOWN_GRACE_MS = 1_000;
@@ -107,16 +108,11 @@ export function serve(stream: Stream, piArgs: string[] = []) {
       configDirectory = mkdtempSync(join(tmpdir(), "lody-pi-mcp-"));
       const configPath = join(configDirectory, "servers.json");
       writeFileSync(configPath, "[]", { mode: 0o600 });
-      const entry = fileURLToPath(
-        new URL(
-          "./bundle/cli.js",
-          import.meta.resolve("@earendil-works/pi-coding-agent"),
-        ),
-      );
+      const { command, args: launchArgs, shell } = resolvePiLaunch();
       child = spawn(
-        process.execPath,
+        command,
         [
-          entry,
+          ...launchArgs,
           ...parsed.args,
           "--mode",
           "rpc",
@@ -126,6 +122,7 @@ export function serve(stream: Stream, piArgs: string[] = []) {
         ],
         {
           cwd,
+          shell,
           env: {
             ...process.env,
             [MCP_CONFIG_ENV]: configPath,

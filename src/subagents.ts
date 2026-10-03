@@ -10,6 +10,7 @@ import type {
 import type { LodySubagentTask, LodyTaskMeta } from "acp-extension-core";
 import { z } from "zod";
 import { PI_EXTENSIONS_ENV } from "./extensions.js";
+import { resolvePiLaunch } from "./launch.js";
 
 const MAX_OUTPUT = 64 * 1024;
 type Task = {
@@ -47,19 +48,14 @@ export function registerSubagents(
       if (!ctx.model)
         throw new Error("Select a model before starting a subagent");
       const id = randomUUID();
-      const entry = fileURLToPath(
-        new URL(
-          "./bundle/cli.js",
-          import.meta.resolve("@earendil-works/pi-coding-agent"),
-        ),
-      );
+      const { command, args: launchArgs, shell } = resolvePiLaunch();
       const extensions: string[] = JSON.parse(
         process.env[PI_EXTENSIONS_ENV] ?? "[]",
       );
       const proc = spawn(
-        process.execPath,
+        command,
         [
-          entry,
+          ...launchArgs,
           "--mode",
           "json",
           "-p",
@@ -77,6 +73,7 @@ export function registerSubagents(
         ],
         {
           cwd: ctx.cwd,
+          shell,
           stdio: ["ignore", "pipe", "pipe"],
           // Stay in the parent Pi process group so adapter shutdown also kills
           // children if Pi cannot finish its cooperative shutdown hook.
