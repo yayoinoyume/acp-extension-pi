@@ -56,11 +56,17 @@ function peer() {
     sessionFile: nativeSession,
     model,
     thinkingLevel: "off",
+    // Mirror Pi's own session state so the adapter can tell a prompt that
+    // started a run from one Pi consumed as an extension command.
+    isStreaming: false,
+    isCompacting: false,
+    pendingMessageCount: 0,
   };
   const emit = (value: unknown) =>
     output.enqueue(new TextEncoder().encode(JSON.stringify(value) + "\n"));
   let defaultPrompt: Record<string, unknown> | undefined;
   const finish = () => {
+    state.isStreaming = false;
     emit({ type: "agent_settled" });
     if (defaultPrompt) {
       reply(defaultPrompt);
@@ -70,13 +76,21 @@ function peer() {
   let onPrompt = (request: Record<string, unknown>) => {
     defaultPrompt = request;
     reply(request);
+    state.isStreaming = true;
     emit({ type: "agent_start" });
     emit({ type: "message_start", message: { role: "assistant" } });
+    messages.push({ role: "user", content: String(request.message ?? "") });
+    messages.push({ role: "assistant", content: "answer" });
   };
   let onAbort = (request: Record<string, unknown>) => {
     finish();
     reply(request);
   };
+  // Every prompt that starts a model turn appends a native user message; a
+  // prompt Pi consumes itself (an extension command) appends none.
+  const messages: Record<string, unknown>[] = [];
+  let onMessages = (request: Record<string, unknown>) =>
+    reply(request, { messages });
   let onClearQueue = (request: Record<string, unknown>) => reply(request, {});
   let onCompact = (request: Record<string, unknown>) => reply(request, {});
   let onState = (request: Record<string, unknown>) => reply(request, state);
@@ -197,6 +211,9 @@ function peer() {
         case "clear_queue":
           onClearQueue(request);
           break;
+        case "get_messages":
+          onMessages(request);
+          break;
         case "extension_ui_response":
           replies.push(request);
           questionAnswered.resolve(request);
@@ -287,6 +304,11 @@ function peer() {
     setPrompt: (handler: typeof onPrompt) => {
       onPrompt = handler;
     },
+    /** A prompt Pi consumes without a model turn: no start, no settlement. */
+    consume: (request: Record<string, unknown>) => {
+      reply(request);
+    },
+    messages,
     close: () => output.close(),
   };
 }
@@ -399,6 +421,56 @@ describe("native Pi connection", () => {
       "compact",
       "stats",
     ]);
+    p.close();
+  });
+
+  it("settles a prompt Pi consumed as an extension command instead of hanging on agent_settled", async () => {
+    const p = peer();
+    await start(p);
+    // An extension command such as /fff-mode only notifies: Pi acknowledges the
+    // prompt, starts no run, emits nothing, and appends nothing to the session.
+    p.setPrompt((request) => p.consume(request));
+    await expect(
+      p.client.prompt({
+        sessionId: nativeSession,
+        prompt: [{ type: "text", text: "/fff-mode" }],
+      }),
+    ).resolves.toEqual({ stopReason: "end_turn" });
+    // The session is left usable: a following ordinary turn still runs to settle.
+    p.setPrompt((request) => {
+      p.reply(request);
+      p.emit({ type: "agent_start" });
+      p.emit(text("answered"));
+      p.finish();
+    });
+    await expect(p.client.prompt(prompt)).resolves.toEqual({
+      stopReason: "end_turn",
+    });
+    expect(
+      p.updates
+        .map((n) => n.update)
+        .filter((u) => u.sessionUpdate === "agent_message_chunk"),
+    ).toMatchObject([{ content: { text: "answered" } }]);
+    expect(JSON.stringify(p.updates)).toContain(
+      "/fff-mode without starting a model turn",
+    );
+    p.close();
+  });
+
+  it("keeps waiting for settlement when Pi accepted a prompt that did run", async () => {
+    const p = peer();
+    await start(p);
+    const done = p.client.prompt(prompt);
+    await p.accepted.promise;
+    // Still streaming, nothing settled yet: the barrier must not give up.
+    expect(p.state.isStreaming).toBe(true);
+    p.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "late" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    p.finish();
+    await expect(done).resolves.toEqual({ stopReason: "end_turn" });
     p.close();
   });
 

@@ -33,6 +33,9 @@ const stateSchema = z.object({
   sessionFile: z.string().optional(),
   model: modelSchema.nullish(),
   thinkingLevel: z.string(),
+  isStreaming: z.boolean().optional(),
+  isCompacting: z.boolean().optional(),
+  pendingMessageCount: z.number().optional(),
 });
 const contentSchema = z.array(
   z.discriminatedUnion("type", [
@@ -189,6 +192,7 @@ type Run = Progress &
     cancellation?: Promise<void>;
     settled: ReturnType<typeof deferred<void>>;
     accepted?: Promise<unknown>;
+    message: string;
   };
 type Host = {
   subagentEvents?: boolean;
@@ -232,6 +236,9 @@ export class PiRpcConnection implements AgentConnection {
   private compactions = 0;
   private lastModelKey?: string;
   private steerCommand = "";
+  /** Native transcript length before the current prompt. A command-only prompt
+   * leaves it unchanged; every real turn appends at least its user message. */
+  private nativeMessageCount = 0;
   private pendingSteer?: {
     id: string;
     run: Run;
@@ -551,6 +558,7 @@ export class PiRpcConnection implements AgentConnection {
       completed: false,
       cancelled: false,
       settled: deferred<void>(),
+      message,
     };
     this.active = run;
     try {
@@ -582,14 +590,14 @@ export class PiRpcConnection implements AgentConnection {
         }
         responseText = "Context compacted.";
       } else {
+        // Baseline before dispatch: a turn that already ran has appended its
+        // user message, a command Pi consumed itself has not.
+        this.nativeMessageCount = (await this.messages()).messages.length;
         run.accepted = this.rpc.request("prompt", {
           message,
           ...(images.length ? { images } : {}),
         });
-        await run.accepted;
-        // Only the packaged tools are loaded. They complete inside Pi's native
-        // tool await; no extension can start detached work after settlement.
-        await run.settled.promise;
+        await this.awaitSettlement(run);
       }
       // Execution and output delivery are separate barriers.
       await this.rpc.drain();
@@ -637,10 +645,54 @@ export class PiRpcConnection implements AgentConnection {
     }
   };
 
+  /**
+   * Waits for Pi to settle the turn this prompt started, or proves there was no
+   * turn to settle.
+   *
+   * A prompt Pi handled itself - an extension command such as /fff-mode that
+   * only notifies - is acknowledged as a bare success and never emits
+   * agent_settled, so waiting for settlement alone would hang the session.
+   * Settlement still owns every real turn; Pi's own state is consulted only
+   * once the acknowledgement proves the runtime is past deciding what to do.
+   */
+  private async awaitSettlement(run: Run): Promise<void> {
+    await run.accepted;
+    if (!run.modelSettled && (await this.consumedWithoutModelTurn())) {
+      await this.notice(
+        `Pi handled /${run.message.trim().slice(1).split(/\s+/)[0] || run.message} without starting a model turn.`,
+      );
+      return;
+    }
+    await run.settled.promise;
+  }
+
   private finishRun(run: Run): void {
     if (run.cancelled) run.resolve({ stopReason: "cancelled" });
     else if (run.error) run.reject(new Error(run.error));
     else run.resolve({ stopReason: run.stopReason ?? "end_turn" });
+  }
+
+  /**
+   * A prompt Pi handled itself - an extension command that only notifies, such
+   * as /fff-mode - produces no agent run: no agent_start, no agent_settled, and
+   * nothing appended to the native session. Pi 0.87.0 reports such a prompt as a
+   * bare success, so the settled barrier cannot be the only completion rule.
+   *
+   * Pi's own state decides instead of event traces, which the wire queue may not
+   * have delivered yet: an accepted prompt that left Pi idle with no queued work
+   * and no new message was consumed without a model turn. Anything that did
+   * start a run reports streaming here and keeps waiting for settlement.
+   */
+  private async consumedWithoutModelTurn(): Promise<boolean> {
+    await this.rpc.drain();
+    this.assertReady();
+    const state = await this.readState();
+    if (state.isStreaming || state.isCompacting || state.pendingMessageCount)
+      return false;
+    // A turn that already ran leaves its user message behind even before its
+    // events reach the queue; treat that as unsettled rather than as a command.
+    const { messages } = await this.messages();
+    return messages.length === this.nativeMessageCount;
   }
 
   private async refreshConfigOptions(): Promise<void> {
@@ -772,6 +824,13 @@ export class PiRpcConnection implements AgentConnection {
   private assertReady(): void {
     if (!this.steerCommand)
       throw new Error("Required Lody Pi extension did not initialize");
+  }
+
+  /** Pi's native transcript, the only record of what a prompt actually produced. */
+  private async messages(): Promise<{ messages: unknown[] }> {
+    return z
+      .object({ messages: z.array(z.unknown()) })
+      .parse(await this.rpc.request("get_messages"));
   }
 
   private async event(event: Record<string, unknown>): Promise<void> {

@@ -3,3 +3,7 @@ dist/
 *.tgz
 native/build/
 native/*.node
+
+# Local working notes and pre-change backups; never committed.
+.backups/
+.analysis/
