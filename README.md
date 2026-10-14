@@ -61,6 +61,10 @@ runtime is still required before this reaches Lody's installed Pi provider.
 - Questionnaire: one or more questions in Lody's existing question card.
 - Todo: list/add/toggle/clear through Lody's existing checklist.
 - Subagent: native Lody task lifecycle, list, output and individual cancellation.
+- Commands from enabled Pi extensions, prompt templates and skills in the client
+  command menu. A command Pi executes itself instead of answering as a message
+  closes its turn with a notice instead of running to model settlement, so the
+  session stays usable.
 
 MCP audio, resource links and embedded resources are unsupported: a result containing
 any of these fails explicitly, including mixed results. Structured JSON output is
