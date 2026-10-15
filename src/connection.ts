@@ -22,6 +22,11 @@ import {
   toModelUsage,
 } from "./usage.js";
 import { PI_RPC_VERSION } from "./version.js";
+import {
+  detectCapabilities,
+  liveProbes,
+  type PiCapabilities,
+} from "./capability.js";
 import { QUESTION_PREFIX, questionsSchema } from "./builtin-tools.js";
 
 const modelSchema = z.object({
@@ -33,6 +38,9 @@ const stateSchema = z.object({
   sessionFile: z.string().optional(),
   model: modelSchema.nullish(),
   thinkingLevel: z.string(),
+  isStreaming: z.boolean().optional(),
+  isCompacting: z.boolean().optional(),
+  pendingMessageCount: z.number().optional(),
 });
 const contentSchema = z.array(
   z.discriminatedUnion("type", [
@@ -84,6 +92,11 @@ type WithCommands<T> = T & {
   availableCommands: acp.AvailableCommand[];
 };
 type SessionResponseWithCommands = WithCommands<acp.NewSessionResponse>;
+/** How a handled prompt waits for a detached run: poll interval, how long the
+ * runtime must stay quiet, and the ceiling no single extension may exceed. */
+const DETACHED_POLL_MS = 50;
+const DETACHED_QUIET_MS = 3000;
+const DETACHED_MAX_WINDOW_MS = 5000;
 const LOCAL_COMMANDS = [
   { name: "compact", description: "Manually compact the session context" },
   { name: "stats", description: "Show Pi session usage and cost" },
@@ -200,6 +213,10 @@ type Run = Progress &
     cancellation?: Promise<void>;
     settled: ReturnType<typeof deferred<void>>;
     accepted?: Promise<unknown>;
+    /** The prompt text, echoed for notices that name the command. */
+    message: string;
+    /** What the runtime reported about dispatch, when it reports at all. */
+    disposition?: string;
   };
 type Host = {
   subagentEvents?: boolean;
@@ -243,6 +260,15 @@ export class PiRpcConnection implements AgentConnection {
   private compactions = 0;
   private lastModelKey?: string;
   private steerCommand = "";
+  private capabilities: PiCapabilities = { hasDisposition: false };
+  private capabilityProbe?: Promise<PiCapabilities>;
+  /** No disposition means either a runtime older than 0.99.0 or a failed
+   * probe; both keep the safe path that withholds extension commands. */
+  private get legacy(): boolean {
+    return !this.capabilities.hasDisposition;
+  }
+  /** A turn closed while the runtime was idle. Its late events are orphans. */
+  private closedIdleRun?: Run;
   private pendingSteer?: {
     id: string;
     run: Run;
@@ -253,6 +279,8 @@ export class PiRpcConnection implements AgentConnection {
     stream: PiStream,
     private readonly host: Host,
     decorateFailure?: (error: Error) => Error,
+    /** Launch coordinates, used to probe the runtime for its capabilities. */
+    private readonly launchProbe?: { command: string; entry: string },
   ) {
     this.rpc = new PiTransport(
       stream,
@@ -276,8 +304,24 @@ export class PiRpcConnection implements AgentConnection {
     await this.rpc.drain();
     if (!this.steerCommand)
       throw new Error("Required Lody Pi extension did not initialize");
+    this.capabilities = await this.probe();
     return initializeResponse();
   };
+
+  /** Resolve the runtime's dispatch-reporting capability once per activation. */
+  private probe(): Promise<PiCapabilities> {
+    if (this.capabilityProbe) return this.capabilityProbe;
+    const launch = this.launchProbe;
+    if (!launch) return Promise.resolve({ hasDisposition: false });
+    this.capabilityProbe = detectCapabilities(
+      { command: launch.command, entry: launch.entry },
+      {
+        ...liveProbes,
+        steer: (fields) => this.rpc.request("steer", fields),
+      },
+    );
+    return this.capabilityProbe;
+  }
 
   close(): void {
     this.rpc.close();
@@ -563,6 +607,7 @@ export class PiRpcConnection implements AgentConnection {
       completed: false,
       cancelled: false,
       settled: deferred<void>(),
+      message,
     };
     this.active = run;
     try {
@@ -599,9 +644,18 @@ export class PiRpcConnection implements AgentConnection {
           ...(images.length ? { images } : {}),
         });
         await run.accepted;
-        // Only the packaged tools are loaded. They complete inside Pi's native
-        // tool await; no extension can start detached work after settlement.
-        await run.settled.promise;
+        if (this.legacy) {
+          await run.settled.promise;
+        } else {
+          const disposition = await this.promptDisposition(run);
+          run.disposition = disposition;
+          if (disposition && disposition !== "started") {
+            await this.awaitPossibleDetachedTurn(run);
+            if (run.started) await run.settled.promise;
+          } else {
+            await run.settled.promise;
+          }
+        }
       }
       // Execution and output delivery are separate barriers.
       await this.rpc.drain();
@@ -622,17 +676,11 @@ export class PiRpcConnection implements AgentConnection {
       await this.refreshConfigOptions();
       if (message.trim() !== "/stats" || images.length)
         await this.reportUsage();
-      if (!run.cancelled && !run.error) {
-        if (responseText)
-          await this.update({
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: responseText },
-          });
-        else if (!run.started)
-          await this.notice(
-            "Pi processed this input without starting a model turn.",
-          );
-      }
+      if (!run.cancelled && !run.error && responseText)
+        await this.update({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: responseText },
+        });
       this.finishRun(run);
       return await run.promise;
     } finally {
@@ -989,7 +1037,19 @@ export class PiRpcConnection implements AgentConnection {
       process.stderr.write(`Pi extension diagnostic: ${String(event.error)}\n`);
       return;
     }
-    if (!run) return;
+    // An extension can dispatch its run after the handler returned and the
+    // adapter already closed the turn as idle. Report its arrival; its output
+    // is not forwarded, because no run is left to carry it to the client.
+    if (!run) {
+      const closed = this.closedIdleRun;
+      if (closed && event.type === "agent_start") {
+        this.closedIdleRun = undefined;
+        void this.notice(
+          `Pi started a model turn after /${closed.message.trim().slice(1).split(/\s+/)[0] || closed.message} was handled.`,
+        );
+      }
+      return;
+    }
     switch (event.type) {
       case "agent_start":
         run.started = true;
@@ -1251,6 +1311,66 @@ export class PiRpcConnection implements AgentConnection {
     if (update) this.host.usage(update);
   }
 
+  /** The dispatch disposition the runtime attached to the accepted prompt. */
+  private async promptDisposition(run: Run): Promise<string | undefined> {
+    const payload = (await run.accepted) as
+      { disposition?: string } | undefined;
+    return typeof payload?.disposition === "string"
+      ? payload.disposition
+      : undefined;
+  }
+
+  /**
+   * A handled prompt started no run of its own, but an extension may still
+   * dispatch one after its handler returns, as pi-goal-x does for autonomous
+   * goals. Hold the turn until the runtime stays quiet, measured from the last
+   * sign of work so a late dispatch cannot find the turn already closed.
+   */
+  private async awaitPossibleDetachedTurn(run: Run): Promise<void> {
+    await this.rpc.drain();
+    this.assertReady();
+    if (run.started || (await this.turnUnderway(run))) return;
+    const opened = Date.now();
+    let lastBusy = opened;
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, DETACHED_POLL_MS));
+      await this.rpc.drain();
+      this.assertReady();
+      // A dispatched run hands the wait back to the caller's settlement barrier.
+      if (run.started || run.cancelled) return;
+      if (await this.turnUnderway(run)) lastBusy = Date.now();
+      if (Date.now() - lastBusy >= DETACHED_QUIET_MS) break;
+      if (Date.now() - opened >= DETACHED_MAX_WINDOW_MS) break;
+    }
+    if (run.started || (await this.turnUnderway(run))) return;
+    // Remembered so a run the extension dispatched after the window closed is
+    // reported rather than silently dropped into an idle session.
+    this.closedIdleRun = run;
+    await this.notice(
+      `Pi handled /${run.message.trim().slice(1).split(/\s+/)[0] || run.message} without starting a model turn.`,
+    );
+  }
+
+  /**
+   * Pi's own view of whether work is in flight, not just what arrived.
+   *
+   * A settled run reads as busy on purpose: it hands the wait back to the
+   * caller, whose settlement barrier is already satisfied.
+   */
+  private async turnUnderway(run: Run): Promise<boolean> {
+    if (run.started || run.modelSettled) return true;
+    try {
+      const state = await this.readState();
+      return Boolean(
+        state.isStreaming || state.isCompacting || state.pendingMessageCount,
+      );
+    } catch {
+      // An unreadable state must not read as idle, or flapping I/O would let the
+      // window close a turn that is still running.
+      return true;
+    }
+  }
+
   /** Local handlers win over Pi's own commands on a name collision. */
   private async availableCommands(): Promise<acp.AvailableCommand[]> {
     const commands = new Map<string, acp.AvailableCommand>();
@@ -1266,9 +1386,8 @@ export class PiRpcConnection implements AgentConnection {
         // The private steer transport is registered as a Pi command, but it is
         // adapter plumbing and must never reach the client command list.
         if (command.name === this.steerCommand) continue;
-        // Pi 0.87.0 cannot report whether an extension command starts a model
-        // turn, so withhold them until a reliable disposition exists.
-        if (command.source === "extension") continue;
+        // Without a disposition a command's model turn is unknowable.
+        if (this.legacy && command.source === "extension") continue;
         if (commands.has(command.name)) continue;
         commands.set(command.name, {
           name: command.name,
@@ -1294,7 +1413,7 @@ export class PiRpcConnection implements AgentConnection {
         await this.rpc.request("get_commands"),
       );
       const command = result.commands.find((entry) => entry.name === name);
-      if (command?.source === "extension")
+      if (this.legacy && command?.source === "extension")
         throw new ExtensionCommandError(name);
     } catch (error) {
       if (error instanceof ExtensionCommandError) throw error;

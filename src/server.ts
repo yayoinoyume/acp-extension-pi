@@ -179,6 +179,8 @@ export function serve(stream: Stream, piArgs: string[] = []) {
           question: (request) => client.unstable_createElicitation(request),
         },
         (error) => diagnostics.decorateError(error),
+        // Lets initialize probe the runtime for its dispatch capabilities.
+        { command, entry: launchArgs[0] ?? command },
       );
       current = pi;
       runtime = Promise.race([

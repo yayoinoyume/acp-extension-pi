@@ -73,6 +73,9 @@ function peer() {
     emit({ type: "agent_start" });
     emit({ type: "message_start", message: { role: "assistant" } });
   };
+  // Mirrors a dispose-capable runtime: the steer reply carries a disposition.
+  let onSteer = (request: Record<string, unknown>) =>
+    reply(request, { disposition: "handled" });
   let onAbort = (request: Record<string, unknown>) => {
     finish();
     reply(request);
@@ -193,6 +196,9 @@ function peer() {
           onPrompt(request);
           promptReceived.resolve();
           break;
+        case "steer":
+          onSteer(request);
+          break;
         case "abort":
           onAbort(request);
           break;
@@ -265,8 +271,19 @@ function peer() {
     setCommands(handler: typeof onCommands) {
       onCommands = handler;
     },
+    setSteer(handler: typeof onSteer) {
+      onSteer = handler;
+    },
+    /** A steer reply without a disposition makes the probe read the runtime
+     * as an old one, which drives the connection down its legacy path. */
+    setLegacyRuntime() {
+      onSteer = (request) => reply(request);
+    },
     get client() {
-      return (client ??= new PiRpcConnection(stream, host));
+      return (client ??= new PiRpcConnection(stream, host, undefined, {
+        command: process.execPath,
+        entry: "/pkg/bundle/cli.js",
+      }));
     },
     stream,
     readable,
@@ -326,6 +343,7 @@ const lodyEvent = (payload: Record<string, unknown>) => ({
 describe("native Pi connection", () => {
   it("reports local and Pi slash commands on session creation", async () => {
     const p = peer();
+    p.setLegacyRuntime();
     const response = await start(p);
     const commands = (response as { availableCommands: unknown })
       .availableCommands;
@@ -356,6 +374,7 @@ describe("native Pi connection", () => {
 
   it("reports slash commands on loadSession too", async () => {
     const p = peer();
+    p.setLegacyRuntime();
     await p.client.initialize({ protocolVersion: 1 });
     const response = (await p.client.loadSession({
       sessionId: nativeSession,
@@ -373,6 +392,7 @@ describe("native Pi connection", () => {
 
   it("re-broadcasts slash commands as a session update", async () => {
     const p = peer();
+    p.setLegacyRuntime();
     await start(p);
     // The broadcast is deferred to a macrotask, so let the event loop turn.
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -393,6 +413,7 @@ describe("native Pi connection", () => {
 
   it("falls back to local commands when Pi rejects get_commands", async () => {
     const p = peer();
+    p.setLegacyRuntime();
     p.setCommands((request) =>
       reply(request, undefined, "Unknown command: get_commands"),
     );
@@ -409,6 +430,7 @@ describe("native Pi connection", () => {
 
   it("withholds extension commands from the available commands menu", async () => {
     const p = peer();
+    p.setLegacyRuntime();
     await start(p);
     // The broadcast is deferred to a macrotask, so let the event loop turn.
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -429,6 +451,7 @@ describe("native Pi connection", () => {
 
   it("rejects a manual extension command without creating a run", async () => {
     const p = peer();
+    p.setLegacyRuntime();
     await start(p);
     await expect(
       p.client.prompt({
@@ -439,6 +462,232 @@ describe("native Pi connection", () => {
     const next = p.client.prompt(prompt);
     p.finish();
     expect(await next).toEqual({ stopReason: "end_turn" });
+    p.close();
+  });
+
+  // ── disposition-aware runtimes (Pi 0.99.0+) ─────────────────────────────
+
+  it("lists extension commands once the runtime reports a disposition", async () => {
+    const p = peer();
+    await start(p);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const update = p.updates
+      .map((n) => n.update)
+      .find((u) => u.sessionUpdate === "available_commands_update");
+    const names = (
+      update as { availableCommands: Array<{ name: string }> }
+    ).availableCommands.map((command) => command.name);
+    expect(names).toContain("fff-mode");
+    expect(names).toContain("review");
+    expect(names).toContain("skill:commit");
+    p.close();
+  });
+
+  it("settles a handled extension command without a model turn", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => {
+      // A command Pi consumed itself: acknowledged with a disposition, but no
+      // agent_start and no agent_settled follow.
+      p.reply(request, { disposition: "handled" });
+    });
+    // The default get_state reply already describes an idle session.
+    const response = await p.client.prompt({
+      sessionId: nativeSession,
+      prompt: [{ type: "text", text: "/fff-mode" }],
+    });
+    expect(response).toEqual({ stopReason: "end_turn" });
+    p.close();
+  }, 10000);
+
+  it("waits for a turn an extension command dispatches late", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => {
+      p.reply(request, { disposition: "handled" });
+      // pi-goal-x style: the run is dispatched after the handler returns.
+      setTimeout(() => {
+        p.emit({ type: "agent_start" });
+        p.emit({ type: "message_start", message: { role: "assistant" } });
+        setTimeout(() => p.finish(), 0);
+      }, 20);
+    });
+    // The runtime reports idle; only the dispatched run announces itself.
+    p.setState((request) =>
+      p.reply(request, { ...p.state, isStreaming: false, messageCount: 0 }),
+    );
+    const response = await p.client.prompt({
+      sessionId: nativeSession,
+      prompt: [{ type: "text", text: "/goal-direct ship it" }],
+    });
+    expect(response).toEqual({ stopReason: "end_turn" });
+    p.close();
+  }, 15000);
+
+  it("holds the turn while the runtime keeps reporting work in flight", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => p.reply(request, { disposition: "handled" }));
+    // Busy for the first stretch of polls, then a run announces itself. A
+    // single idle answer must not close the turn before the run lands, and a
+    // busy runtime must never be read as a finished command.
+    let polls = 0;
+    p.setState((request) => {
+      polls += 1;
+      p.reply(request, {
+        ...p.state,
+        isStreaming: polls < 10,
+        messageCount: polls < 10 ? 2 : 0,
+      });
+    });
+    // Cleared on close, so the run cannot land after the stream is gone.
+    const dispatch = setTimeout(() => {
+      p.emit({ type: "agent_start" });
+      p.emit({ type: "message_start", message: { role: "assistant" } });
+      p.finish();
+    }, 600);
+    try {
+      const response = await p.client.prompt({
+        sessionId: nativeSession,
+        prompt: [{ type: "text", text: "/goal-direct ship it" }],
+      });
+      expect(response).toEqual({ stopReason: "end_turn" });
+    } finally {
+      clearTimeout(dispatch);
+    }
+    const notices = p.updates
+      .map((n) => n.update)
+      .filter(
+        (u) =>
+          u.sessionUpdate === "session_info_update" &&
+          String(u._meta?.lody?.notice?.message ?? "").includes(
+            "without starting a model turn",
+          ),
+      );
+    expect(
+      notices.map((n) => n._meta?.lody?.notice?.message ?? ""),
+    ).not.toContain("Pi handled /goal-direct without starting a model turn.");
+    p.close();
+  }, 15000);
+
+  it("holds the turn open for a run dispatched past the quiet period", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => p.reply(request, { disposition: "handled" }));
+    // Quiet for a while, then a sign of work, then the run itself. The late
+    // sign of work must restart the quiet period rather than let the ceiling
+    // close a turn whose run has not landed yet.
+    let ran = false;
+    p.setState((request) =>
+      p.reply(request, {
+        ...p.state,
+        isStreaming: ran,
+        messageCount: ran ? 2 : 0,
+      }),
+    );
+    setTimeout(() => {
+      ran = true;
+    }, 2000);
+    const dispatch = setTimeout(() => {
+      p.emit({ type: "agent_start" });
+      p.emit({ type: "message_start", message: { role: "assistant" } });
+      p.finish();
+    }, 4200);
+    try {
+      const response = await p.client.prompt({
+        sessionId: nativeSession,
+        prompt: [{ type: "text", text: "/goal-direct ship it" }],
+      });
+      expect(response).toEqual({ stopReason: "end_turn" });
+      const closed = p.updates
+        .map((n) => n.update)
+        .some(
+          (u) =>
+            u.sessionUpdate === "session_info_update" &&
+            String(u._meta?.lody?.notice?.message ?? "").includes(
+              "without starting a model turn",
+            ),
+        );
+      expect(closed).toBe(false);
+    } finally {
+      clearTimeout(dispatch);
+    }
+    p.close();
+  }, 15000);
+
+  it("abandons the wait when the session is cancelled", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => p.reply(request, { disposition: "handled" }));
+    p.setState((request) =>
+      p.reply(request, { ...p.state, isStreaming: false, messageCount: 0 }),
+    );
+    const running = p.client.prompt({
+      sessionId: nativeSession,
+      prompt: [{ type: "text", text: "/fff-mode" }],
+    });
+    // Cancel while the window is still holding the turn open.
+    setTimeout(() => void p.client.cancel({ sessionId: nativeSession }), 100);
+    expect(await running).toEqual({ stopReason: "cancelled" });
+    p.close();
+  }, 15000);
+
+  it("reports a run dispatched after the window closed", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => p.reply(request, { disposition: "handled" }));
+    p.setState((request) =>
+      p.reply(request, { ...p.state, isStreaming: false, messageCount: 0 }),
+    );
+    const response = await p.client.prompt({
+      sessionId: nativeSession,
+      prompt: [{ type: "text", text: "/fff-mode" }],
+    });
+    expect(response).toEqual({ stopReason: "end_turn" });
+    const turnClosed = p.updates
+      .map((n) => n.update)
+      .some(
+        (u) =>
+          u.sessionUpdate === "session_info_update" &&
+          String(u._meta?.lody?.notice?.message ?? "").includes(
+            "without starting a model turn",
+          ),
+      );
+    expect(turnClosed).toBe(true);
+    // A late run after that notice is reported, not silently dropped.
+    p.emit({ type: "agent_start" });
+    p.emit({ type: "message_start", message: { role: "assistant" } });
+    p.finish();
+    // The notice is dispatched from the event handler; let it reach the host.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const late = p.updates
+      .map((n) => n.update)
+      .some(
+        (u) =>
+          u.sessionUpdate === "session_info_update" &&
+          String(u._meta?.lody?.notice?.message ?? "").includes(
+            "started a model turn after",
+          ),
+      );
+    expect(late).toBe(true);
+    p.close();
+  }, 15000);
+
+  it("treats a started disposition as an ordinary turn", async () => {
+    const p = peer();
+    await start(p);
+    p.setPrompt((request) => {
+      p.reply(request, { disposition: "started" });
+      p.emit({ type: "agent_start" });
+      p.emit({ type: "message_start", message: { role: "assistant" } });
+      p.finish();
+    });
+    expect(
+      await p.client.prompt({
+        sessionId: nativeSession,
+        prompt: [{ type: "text", text: "hello" }],
+      }),
+    ).toEqual({ stopReason: "end_turn" });
     p.close();
   });
 

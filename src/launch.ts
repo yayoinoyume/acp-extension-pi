@@ -5,6 +5,8 @@ export const PI_PATH_ENV = "LODY_PI_PATH";
 export type PiLaunch = {
   command: string;
   args: string[];
+  /** The Pi entry the command runs; with --version it reports the semver. */
+  entry: string;
 };
 
 /**
@@ -18,12 +20,10 @@ export function resolvePiLaunch(
 ): PiLaunch {
   const override = env[PI_PATH_ENV]?.trim();
   if (!override) {
-    return {
-      command: process.execPath,
-      args: [resolveBundledEntry(), ...extraArgs],
-    };
+    const entry = resolveBundledEntry();
+    return { command: process.execPath, args: [entry, ...extraArgs], entry };
   }
-  return { command: override, args: extraArgs };
+  return { command: override, args: extraArgs, entry: override };
 }
 
 function defaultBundledEntry(): string {
